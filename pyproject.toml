@@ -1,0 +1,10 @@
+[project]
+name = "sciruntime"
+version = "0.1.0"
+description = "In-process / local-subprocess parallel scientific compute runtime"
+requires-python = ">=3.11"
+dependencies = ["numpy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
