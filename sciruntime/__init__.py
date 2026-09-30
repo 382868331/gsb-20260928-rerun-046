@@ -9,7 +9,7 @@ from .blocks import Block, BlockStore
 from .graph import Graph, Node
 from .operators import Operator, register_operator, operator_registry
 from .executor import Executor, ExecutionStats
-from .checkpoint import CheckpointStore
+from .checkpoint import CheckpointError, CheckpointStore
 
 __all__ = [
     "Block",
@@ -21,5 +21,6 @@ __all__ = [
     "operator_registry",
     "Executor",
     "ExecutionStats",
+    "CheckpointError",
     "CheckpointStore",
 ]

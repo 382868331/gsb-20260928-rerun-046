@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -139,3 +141,19 @@ class Graph:
             for bid in self._producers
             if not self._consumers.get(bid)
         ]
+
+    def graph_id(self) -> str:
+        """稳定任务身份; 工作者数、后端和预算不参与。"""
+        payload = [
+            {
+                "node_id": node.node_id,
+                "operator": node.operator,
+                "inputs": list(node.inputs),
+                "outputs": list(node.outputs),
+                "params": node.params,
+                "memory_bytes": node.memory_bytes,
+            }
+            for node in (self.nodes[nid] for nid in sorted(self.nodes))
+        ]
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=repr)
+        return "sha256:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()

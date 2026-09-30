@@ -6,7 +6,7 @@
 - **数据块 `BlockStore`**: numpy 数组的线程安全仓库, 引用计数 (pin) + 消费者
   计数管理生命周期, 中间块自动回收, 最终输出显式保留。
 - **执行状态 `Executor` / `CheckpointStore`**: 并行调度、内存预算排队、失败
-  传播、幂等发布, 以及完成节点的持久化与恢复。
+  传播、幂等发布, 以及完成节点校验后的细粒度持久化与恢复。
 
 全部在本机运行, 无集群依赖。
 
@@ -18,8 +18,10 @@
   能读到半成品; 失败节点在成功提交前的输出对任何消费者不可见。
 - **幂等发布**: 每节点只允许发布一次, 重试/恢复重放重复执行也不会重复
   `put`; BlockStore 对重复 block_id 的发布直接报错做防御。
-- **检查点恢复**: 所有输出块先原子落盘 (temp + rename) 再更新 `meta.json`,
-  恢复时已完成节点整体跳过、块灌回内存, 结果可逐位重现。
+- **细粒度检查点恢复**: 所有输出块先原子落盘 (temp + rename) 并记录 SHA-256,
+  再更新 `meta.json`; meta 同时绑定稳定图身份和输入指纹。只有完整发布并
+  核验过的节点可复用, 正在执行/写出的节点在重启后重算。恢复时可以改变工作者
+  数量、后端和预算, 但不能换图或换输入。
 - **可扩展算子**: 实现 `Operator.run(inputs, params, ctx)` 并
   `register_operator` 即可, 依赖调度与数据生命周期完全复用, 无需改运行时。
 
@@ -34,8 +36,11 @@
 
 ```bash
 .venv/bin/python -m examples.blocked_matmul_demo   # 线程/子进程/恢复三个场景
-.venv/bin/python -m pytest tests/ -q               # 8 个测试
+.venv/bin/python -m pytest tests/ -q               # 10 个测试
 ```
+
+`tests/test_recovery.py` 会启动三个独立进程, 在共享前置后、两个慢分支执行中
+分别退出, 再用不同工作者数量重开, 并核对节点复用/重算集合与峰值在途数据。
 
 ```python
 from sciruntime import Executor

@@ -149,6 +149,13 @@ class BlockStore:
                 self._data.pop(bid, None)
             return len(dead)
 
+    def discard(self, block_id: str) -> None:
+        """丢弃节点提交失败后不应可见的输出。"""
+        with self._lock:
+            self._data.pop(block_id, None)
+            self._pins.pop(block_id, None)
+            self._lock.notify_all()
+
     # ----- 内存统计 -----
     def resident_bytes(self) -> int:
         with self._lock:

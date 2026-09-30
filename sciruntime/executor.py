@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .blocks import BlockStore
-from .checkpoint import CheckpointStore
+from .checkpoint import CheckpointStore, fingerprint_feed
 from .graph import Graph, Node
 from .operators import TaskContext, get_operator
 
@@ -72,6 +72,10 @@ class ExecutionStats:
     failed: Dict[str, str] = field(default_factory=dict)
     skipped: List[str] = field(default_factory=list)
     from_checkpoint: List[str] = field(default_factory=list)
+    executed: List[str] = field(default_factory=list)
+    stopped: bool = False
+    peak_resident_bytes: int = 0
+    peak_inflight_bytes: int = 0
 
     @property
     def ok(self) -> bool:
@@ -100,6 +104,7 @@ class Executor:
         backend: str = "thread",
         checkpoint: Optional[CheckpointStore] = None,
         max_retries: int = 0,
+        stop_event: Optional[threading.Event] = None,
     ) -> None:
         self.graph = graph
         self.store = store or BlockStore()
@@ -109,6 +114,7 @@ class Executor:
         self.memory_budget = memory_budget
         self.checkpoint = checkpoint
         self.max_retries = max_retries
+        self.stop_event = stop_event
 
         self._cond = threading.Condition()
         self._remaining_deps: Dict[str, int] = {}
@@ -118,6 +124,7 @@ class Executor:
         # 发布去重: 一个节点只允许进入发布阶段一次
         self._published: set = set()
         self._pinned_inputs: Dict[str, List[str]] = {}
+        self._inflight_bytes = 0
         self._stats = ExecutionStats()
 
     # ---------- 公共入口 ----------
@@ -137,6 +144,9 @@ class Executor:
         try:
             inflight: Dict[Future, str] = {}
             while len(self._done) < len(self.graph.nodes):
+                if self.stop_event is not None and self.stop_event.is_set():
+                    self._stats.stopped = True
+                    break
                 with self._cond:
                     newly = self._pump_locked(pool)
                     for nid, fut in newly:
@@ -161,6 +171,7 @@ class Executor:
                     # 结果由 done callback 处理; 这里只负责唤醒后重新 pump
                     with self._cond:
                         self._resolve_future_locked(nid, fut)
+                        self._record_memory_locked()
                         self._cond.notify_all()
         finally:
             pool.shutdown(wait=True)
@@ -172,6 +183,8 @@ class Executor:
 
     # ---------- 初始化 ----------
     def _prepare(self, feed: Dict[str, np.ndarray]) -> None:
+        if self.checkpoint is not None:
+            self.checkpoint.bind_run(self.graph.graph_id(), fingerprint_feed(feed))
         checkpoint_done: set = set()
         if self.checkpoint is not None:
             checkpoint_done = {
@@ -184,7 +197,9 @@ class Executor:
                 c for c in self.graph.consumers_of(bid) if c not in checkpoint_done
             ]
             self.store.register_block(
-                bid, len(live_consumers), retain=not live_consumers
+                bid,
+                len(live_consumers),
+                retain=not self.graph.consumers_of(bid),
             )
         # 外部喂入的源块 (登记其图内消费者数量, 避免被提前回收)
         for bid, val in feed.items():
@@ -192,7 +207,11 @@ class Executor:
                 live = [
                     c for c in self.graph.consumers_of(bid) if c not in checkpoint_done
                 ]
-                self.store.register_block(bid, len(live))
+                self.store.register_block(
+                    bid,
+                    len(live),
+                    retain=len(self.graph.consumers_of(bid)) == 0,
+                )
             self.store.put(bid, np.asarray(val))
         for nid, node in self.graph.nodes.items():
             deps = {self.graph.producer_of(bid) for bid in node.inputs}
@@ -203,16 +222,17 @@ class Executor:
 
         # 检查点恢复: 已完成节点直接标成功并灌回块
         if self.checkpoint is not None:
-            restored = self.checkpoint.load_completed(self.graph.nodes)
             completed_on_disk = [
                 nid for nid in self.graph.nodes if self.checkpoint.is_completed(nid)
             ]
+            restored = self.checkpoint.load_completed(completed_on_disk)
             self.store.restore(restored)
             for nid in completed_on_disk:
                 self._mark_published_locked(nid)
-                self._done[nid] = NodeResult("success")
+                self._finish_success_locked(nid)
                 self._stats.from_checkpoint.append(nid)
-                self._stats.succeeded.append(nid)
+        with self._cond:
+            self._record_memory_locked()
 
     # ---------- 调度循环 ----------
     def _ready_nodes_locked(self) -> List[str]:
@@ -238,7 +258,7 @@ class Executor:
             if budget is not None:
                 resident = self.store.resident_bytes()
                 need = self._required_memory_locked(node)
-                if resident + need > budget:
+                if resident + self._inflight_bytes + need > budget:
                     continue  # 内存不足: 保持排队
 
             # 先取消检查: 任一依赖失败/跳过则本节点跳过
@@ -258,11 +278,15 @@ class Executor:
 
             fut = self._submit(pool, node, inputs, attempt=0)
             self._inflight[nid] = fut
+            self._inflight_bytes += self._required_memory_locked(node)
+            self._record_memory_locked()
             newly.append((nid, fut))
         return newly
 
     def _resolve_future_locked(self, nid: str, fut: Future) -> None:
         """future 完成后的统一处理 (在调用线程持锁执行, 无回调重入)。"""
+        self._stats.executed.append(nid)
+        self._inflight_bytes -= max(0, self.graph.nodes[nid].memory_bytes)
         try:
             outputs = fut.result()
         except BaseException as exc:  # 算子失败
@@ -275,6 +299,11 @@ class Executor:
             self._stats.failed[nid] = detail
             return
         self._release_inputs(nid)
+
+        if self.stop_event is not None and self.stop_event.is_set():
+            self._stats.stopped = True
+            self._inflight.pop(nid, None)
+            return
 
         node = self.graph.nodes[nid]
         if len(outputs) != len(node.outputs):
@@ -302,6 +331,8 @@ class Executor:
             try:
                 self.checkpoint.commit_node(nid, node.outputs, outputs)
             except Exception as exc:
+                for bid in node.outputs:
+                    self.store.discard(bid)
                 self._finish_failure_locked(nid, exc)
                 self._stats.failed[nid] = repr(exc)
                 return
@@ -370,3 +401,12 @@ class Executor:
             except RuntimeError:
                 pass
             self.store.consumer_finished(bid)
+
+    def _record_memory_locked(self) -> None:
+        resident = self.store.resident_bytes()
+        self._stats.peak_resident_bytes = max(
+            self._stats.peak_resident_bytes, resident
+        )
+        self._stats.peak_inflight_bytes = max(
+            self._stats.peak_inflight_bytes, self._inflight_bytes
+        )
