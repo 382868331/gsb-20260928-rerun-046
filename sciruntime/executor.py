@@ -30,7 +30,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .blocks import BlockStore
-from .checkpoint import CheckpointStore
+from .checkpoint import (
+    CheckpointStore,
+    ResumeCancelled,
+    ResumePlan,
+    fingerprint_array,
+)
 from .graph import Graph, Node
 from .operators import TaskContext, get_operator
 
@@ -106,6 +111,7 @@ class Executor:
         max_retries: int = 0,
         crash_after_block: Optional[str] = None,
         exit_after_commits: Optional[int] = None,
+        resume_decider: Optional[Any] = None,
     ) -> None:
         self.graph = graph
         self.store = store or BlockStore()
@@ -117,7 +123,10 @@ class Executor:
         self.max_retries = max_retries
         self._crash_after_block = crash_after_block
         self._exit_after_commits = exit_after_commits
+        # 恢复影响预览回调: 收到 ResumePlan, 返回 True 继续 / False 取消。
+        self._resume_decider = resume_decider
         self._committed = 0
+        self.last_resume_plan: Optional[ResumePlan] = None
 
         self._cond = threading.Condition()
         self._remaining_deps: Dict[str, int] = {}
@@ -129,6 +138,7 @@ class Executor:
         self._pinned_inputs: Dict[str, List[str]] = {}
         self._stats = ExecutionStats()
         self._resumable: set = set()
+        self._node_sources: Dict[str, set] = {}
 
     # ---------- 公共入口 ----------
     def run(self, feed: Optional[Dict[str, np.ndarray]] = None) -> ExecutionStats:
@@ -187,17 +197,37 @@ class Executor:
     def _prepare(self, feed: Dict[str, np.ndarray]) -> None:
         checkpoint_done: set = set()
         if self.checkpoint is not None:
-            self.checkpoint.attach_graph(self.graph.identity())
+            ck = self.checkpoint
+            ck.attach_graph(self.graph.identity())
+            self._node_sources = self.graph.node_source_dependencies()
+            fingerprints = {
+                bid: fingerprint_array(np.asarray(feed[bid]))
+                for bid in self.graph.source_blocks()
+                if bid in feed
+            }
             predecessors = {
                 nid: {self.graph.producer_of(bid) for bid in node.inputs}
                 for nid, node in self.graph.nodes.items()
             }
             for nid, deps in predecessors.items():
                 deps.discard(None)
-            # 只有“完整发布 + 校验和核验 + 前驱全部可信”的节点能复用。
-            checkpoint_done = self.checkpoint.verify_for_graph(
-                self.graph.topological_order(), predecessors
+            # 非破坏性影响预览: 实际输入 + 块校验 + 前驱可信度。
+            plan = ck.plan_for_graph(
+                self.graph.topological_order(), predecessors,
+                node_sources=self._node_sources,
+                input_fingerprints=fingerprints,
             )
+            self.last_resume_plan = plan
+            decider = self._resume_decider or (lambda _plan: True)
+            approved = bool(decider(plan))
+            if not approved:
+                # 取消: 不写入任何指纹、不丢弃任何旧记录。
+                raise ResumeCancelled(
+                    "用户取消恢复: 检查点记录保持原样, 未做任何修改"
+                )
+            # 确认后才改变磁盘: 登记新输入指纹并丢弃失效节点。
+            ck.record_input_fingerprints(fingerprints)
+            checkpoint_done = ck.apply_plan(plan)
             self._resumable = set(checkpoint_done)
         # 生命周期登记: 每个块 *仍待执行* 的消费者数量。
         # 最终输出块 (无消费者) 保留, 调用方取走结果后可用 collect 显式回收。
@@ -429,8 +459,10 @@ class Executor:
 
     def _commit_checkpoint(self, node: Node, outputs: Sequence[np.ndarray]) -> None:
         checkpoint = self.checkpoint
+        sources = sorted(self._node_sources.get(node.node_id, ()))
         if self._crash_after_block is None:
-            checkpoint.commit_node(node.node_id, node.outputs, outputs)
+            checkpoint.commit_node(node.node_id, node.outputs, outputs,
+                                  sources=sources)
         else:
             # 带硬中断钩子的检查点 (通常由独立子进程使用)。
             from .checkpoint import CheckpointStore as _CS
@@ -438,7 +470,8 @@ class Executor:
             crashing = _CS(str(checkpoint.path),
                            crash_after_block=self._crash_after_block)
             crashing.attach_graph(checkpoint.graph_id)
-            crashing.commit_node(node.node_id, node.outputs, outputs)
+            crashing.commit_node(node.node_id, node.outputs, outputs,
+                                 sources=sources)
         self._committed += 1
         if (self._exit_after_commits is not None
                 and self._committed >= self._exit_after_commits):

@@ -20,11 +20,17 @@
   `put`; BlockStore 对重复 block_id 的发布直接报错做防御。
 - **细粒度检查点接续**: 输出块先原子落盘 (temp + rename), 再连同
   sha256 一起更新 `meta.json`; 只有“完整发布 **且** 校验和核验通过
-  **且** 前驱全部可信”的节点能复用。正在写出的块 (*.tmp / 无 meta
-  的孤儿文件)、损坏块及其全部后继在重开时一律失效重算, 后继不可能
-  提前读到半成品或失败节点的输出。检查点绑定图身份哈希, 恢复允许
-  改变 worker 数 / 内存预算 / 后端, 但不允许换图复用。恢复时块按需
-  从磁盘惰性物化, 紧内存预算下也不会“一恢复就死锁”。
+  **且** 前驱全部可信 **且** 传递依赖的外部输入内容指纹与当前喂入
+  一致”的节点能复用。正在写出的块 (*.tmp / 无 meta 的孤儿文件)、
+  损坏块及其全部后继在重开时一律失效重算, 后继不可能提前读到半成品
+  或失败节点的输出。检查点绑定图身份哈希, 恢复允许改变 worker 数 /
+  内存预算 / 后端, 但不允许换图复用。**图形结构相同不等于任务相同**:
+  meta 为每个外部输入块记录 sha256, 实际输入改变时只有依赖被改输入
+  的节点 (及其后继) 失效, 未受影响的分支保留。恢复前可用
+  `CheckpointStore.plan_for_graph` 查看非破坏性影响预览 (复用/重算
+  节点及原因), 或给 Executor 传 `resume_decider=` 回调在看到预览后
+  取消 (抛 `ResumeCancelled`, 旧记录不被修改)。恢复时块按需从磁盘
+  惰性物化, 紧内存预算下也不会“一恢复就死锁”。
 - **可扩展算子**: 实现 `Operator.run(inputs, params, ctx)` 并
   `register_operator` 即可, 依赖调度与数据生命周期完全复用, 无需改运行时。
 
@@ -40,7 +46,7 @@
 ```bash
 .venv/bin/python -m examples.blocked_matmul_demo   # 线程/子进程/恢复三个场景
 .venv/bin/python -m examples.resume_workflow_demo  # 真实硬中断后变 worker 接续
-.venv/bin/python -m pytest tests/ -q               # 13 个测试
+.venv/bin/python -m pytest tests/ -q               # 17 个测试
 ```
 
 ### 接续演示验证了什么

@@ -9,7 +9,12 @@ from .blocks import Block, BlockStore
 from .graph import Graph, Node
 from .operators import Operator, register_operator, operator_registry
 from .executor import Executor, ExecutionStats
-from .checkpoint import CheckpointStore
+from .checkpoint import (
+    CheckpointStore,
+    ResumeCancelled,
+    ResumePlan,
+    fingerprint_array,
+)
 
 __all__ = [
     "Block",
@@ -22,4 +27,7 @@ __all__ = [
     "Executor",
     "ExecutionStats",
     "CheckpointStore",
+    "ResumeCancelled",
+    "ResumePlan",
+    "fingerprint_array",
 ]

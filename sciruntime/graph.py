@@ -92,6 +92,25 @@ class Graph:
     def dependencies(self, node_id: str) -> set:
         return set(self._deps[node_id])
 
+    def node_source_dependencies(self) -> Dict[str, set]:
+        """返回每个节点传递依赖的外部源块 (无生产者、由外部喂入的块)。
+
+        恢复时据此判断“实际输入改变后哪些节点必须重算”: 只有依赖了
+        被改源块的节点失效, 未受影响的分支节点保留复用。
+        """
+        sources = {bid for bid in self._consumers if bid not in self._producers}
+        result: Dict[str, set] = {}
+        for nid in self._topo_order():
+            deps: set = set()
+            for bid in self.nodes[nid].inputs:
+                if bid in sources:
+                    deps.add(bid)
+                producer = self._producers.get(bid)
+                if producer is not None and producer != nid:
+                    deps |= result.get(producer, set())
+            result[nid] = deps
+        return result
+
     def producer_of(self, block_id: str) -> Optional[str]:
         return self._producers.get(block_id)
 
