@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from .blocks import BlockStore
-from .checkpoint import CheckpointStore
+from .checkpoint import CheckpointStore, RecoveryPlan
 from .graph import Graph, Node
 from .operators import TaskContext, get_operator
 
@@ -131,6 +131,20 @@ class Executor:
         self._resumable: set = set()
 
     # ---------- 公共入口 ----------
+    def preview_resume(
+        self, feed: Optional[Dict[str, np.ndarray]] = None
+    ) -> RecoveryPlan:
+        """恢复前的只读影响预览, 不执行任何节点、不改动旧检查点记录。
+
+        返回 :class:`RecoveryPlan`: 哪些已完成节点可以复用、哪些必须重算
+        以及原因 (输入改变 / 输入无法核验 / 上游重算 / 结果块损坏)。
+        用户可以仅查看而不调用 :meth:`run`, 旧记录保持不变 (取消接续)。
+        没有配置检查点时返回空计划。
+        """
+        if self.checkpoint is None:
+            return RecoveryPlan(set(), {}, {}, {}, graph_match=True)
+        return self.checkpoint.plan_recovery(self.graph, feed or {})
+
     def run(self, feed: Optional[Dict[str, np.ndarray]] = None) -> ExecutionStats:
         feed = dict(feed or {})
         self._prepare(feed)
@@ -187,16 +201,12 @@ class Executor:
     def _prepare(self, feed: Dict[str, np.ndarray]) -> None:
         checkpoint_done: set = set()
         if self.checkpoint is not None:
-            self.checkpoint.attach_graph(self.graph.identity())
-            predecessors = {
-                nid: {self.graph.producer_of(bid) for bid in node.inputs}
-                for nid, node in self.graph.nodes.items()
-            }
-            for nid, deps in predecessors.items():
-                deps.discard(None)
-            # 只有“完整发布 + 校验和核验 + 前驱全部可信”的节点能复用。
-            checkpoint_done = self.checkpoint.verify_for_graph(
-                self.graph.topological_order(), predecessors
+            # 任务身份 = 图结构 + 实际输入 + 节点依赖。先做只读的影响
+            # 预览, 确认后才丢弃失效节点并记录新输入指纹; 只看图结构相同
+            # 就复用旧节点会把旧输入的结果当成新输入的结果。
+            plan = self.checkpoint.plan_recovery(self.graph, feed)
+            checkpoint_done = self.checkpoint.apply_recovery(
+                self.graph, plan, feed
             )
             self._resumable = set(checkpoint_done)
         # 生命周期登记: 每个块 *仍待执行* 的消费者数量。
@@ -438,6 +448,8 @@ class Executor:
             crashing = _CS(str(checkpoint.path),
                            crash_after_block=self._crash_after_block)
             crashing.attach_graph(checkpoint.graph_id)
+            # 保留已确认的输入指纹, 避免硬退出钩子写 meta 时把它清空。
+            crashing._inputs = dict(checkpoint._inputs)
             crashing.commit_node(node.node_id, node.outputs, outputs)
         self._committed += 1
         if (self._exit_after_commits is not None

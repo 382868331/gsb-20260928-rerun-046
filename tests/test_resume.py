@@ -100,3 +100,86 @@ def test_peak_inflight_respects_budget(tmp_path):
     info = _final(str(tmp_path), _x(), workers=2, budget=4096)
     assert info["ok"]
     assert info["peak_inflight_bytes"] <= 4096
+
+
+def test_changed_input_same_graph_forces_full_recompute(tmp_path):
+    """图结构完全不变但输入数组改变: 旧节点一个都不能复用。"""
+    d = str(tmp_path)
+    rc, _, err = run_once(d, workers=2, memory_budget=8192,
+                          exit_after_commits=2, slow=False)
+    assert rc == 43, err
+    x_new = np.random.default_rng(99).standard_normal(64)
+    rc, info, err = run_once(d, workers=3, memory_budget=8192,
+                             seed=99, slow=False)
+    assert rc == 0, err
+    assert info["ok"]
+    assert info["from_checkpoint"] == [], info
+    g, _ = build_resume_graph(64)
+    assert set(info["recomputed"]) == set(g.nodes), info
+    # 最终结果必须对应新输入, 而不是旧输入的缓存
+    rc, _, err = run_once(d, workers=1, memory_budget=8192,
+                          seed=99, slow=False)
+    assert rc == 0, err
+    g2, meta = build_resume_graph(64)
+    ck = CheckpointStore(d)
+    ex = Executor(g2, max_workers=2, checkpoint=ck)
+    ex.run(feed={meta["source"]: x_new})
+    assert np.array_equal(ex.result(meta["output"]), serial_reference(x_new))
+    # 且不能等于旧输入的结果
+    assert not np.array_equal(ex.result(meta["output"]), serial_reference(_x()))
+
+
+def test_preview_is_readonly_and_cancellable(tmp_path):
+    """恢复前影响预览不改变旧记录; 用户可以取消接续。"""
+    d = str(tmp_path)
+    rc, _, err = run_once(d, workers=1, memory_budget=8192,
+                          exit_after_commits=2, slow=False)
+    assert rc == 43, err
+    old = CheckpointStore(d)
+    committed_before = set(old.completed_nodes())
+    blocks_before = sorted(os.listdir(os.path.join(d, "blocks")))
+
+    g, meta = build_resume_graph(64)
+    x_new = np.random.default_rng(7).standard_normal(64)
+    plan = old.plan_recovery(g, {meta["source"]: x_new})
+    text = plan.describe()
+    assert "shared0" in plan.recompute and "shared1" in plan.recompute
+    assert plan.reusable == set()
+    assert "必须重算" in text and "输入" in text
+
+    # 不调用 apply_recovery / 不运行 Executor: 旧 meta 与块原样保留
+    after = CheckpointStore(d)
+    assert set(after.completed_nodes()) == committed_before
+    assert sorted(os.listdir(os.path.join(d, "blocks"))) == blocks_before
+
+
+def test_partial_input_change_keeps_unaffected_branch(tmp_path):
+    """双源图只改一个源: 未依赖它的分支保留, 依赖它的分支与 fan-in 重算。"""
+    d = str(tmp_path)
+    rc, info, err = run_once(d, workers=2, memory_budget=8192,
+                             exit_after_commits=4, slow=False,
+                             two_source=True)
+    assert rc == 43, err
+    rc, info, err = run_once(d, workers=4, memory_budget=8192,
+                             seed=123, slow=False, two_source=True)
+    assert rc == 0, err
+    assert info["ok"] and info["result_equal"]
+    assert set(info["from_checkpoint"]) == {"pb", "lb"}, info
+    assert set(info["recomputed"]) == {"pa", "la", "join"}, info
+
+
+def test_corruption_crash_and_changed_input_combined(tmp_path):
+    """换 worker + 结果损坏 + 中途退出 + 输入改变同时出现仍与完整重算一致。"""
+    d = str(tmp_path)
+    rc, _, err = run_once(d, workers=4, memory_budget=8192,
+                          exit_after_commits=3, slow=False,
+                          two_source=True)
+    assert rc == 43, err
+    # 损坏 b 分支的输出块, 同时改变 a 源; worker 数从 4 换成 2。
+    rc, info, err = run_once(d, workers=2, memory_budget=8192,
+                             seed=555, slow=False, two_source=True,
+                             corrupt_block="b1.npy")
+    assert rc == 0, err
+    assert info["ok"] and info["result_equal"], err
+    assert set(info["recomputed"]) == {"pa", "la", "pb", "lb", "join"}, info
+

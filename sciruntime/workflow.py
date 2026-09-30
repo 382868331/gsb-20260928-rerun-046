@@ -162,3 +162,60 @@ def serial_reference(x: np.ndarray, *, n_branches: int = 4) -> np.ndarray:
         leaf = bb * 2.0
         acc = leaf.copy() if acc is None else acc + leaf
     return acc
+
+
+def build_two_source_graph(n: int = 64) -> Tuple[Graph, Dict[str, Any]]:
+    """两个互相独立的源块各自走一条分支, 最后 fan-in 相加。
+
+    用于验证“共享输入只改变一部分”的恢复: 只改 __src_a 时 pa/la 重算,
+    pb/lb 与 __src_b 无关, 必须原样复用; fan-in 节点 join 依赖两侧,
+    总是重算。
+    """
+    g = Graph()
+    nbytes = n * 8
+    g.add_node(
+        "pa", "wf_scale",
+        inputs=("__src_a",), outputs=("a1",),
+        params={"scale": 2.0, "bias": 0.0},
+        memory_bytes=nbytes,
+    )
+    g.add_node(
+        "pb", "wf_scale",
+        inputs=("__src_b",), outputs=("b1",),
+        params={"scale": 1.5, "bias": 1.0},
+        memory_bytes=nbytes,
+    )
+    g.add_node(
+        "la", "wf_leaf",
+        inputs=("a1",), outputs=("la",),
+        params={"scale": 3.0},
+        memory_bytes=nbytes,
+    )
+    g.add_node(
+        "lb", "wf_leaf",
+        inputs=("b1",), outputs=("lb",),
+        params={"scale": -2.0},
+        memory_bytes=nbytes,
+    )
+    g.add_node(
+        "join", "wf_reduce",
+        inputs=("la", "lb"), outputs=("result",),
+        params={},
+        memory_bytes=nbytes,
+    )
+    g.freeze()
+    meta = {
+        "sources": ("__src_a", "__src_b"),
+        "output": "result",
+        "branch_a": ["pa", "la"],
+        "branch_b": ["pb", "lb"],
+        "block_bytes": nbytes,
+    }
+    return g, meta
+
+
+def serial_two_source(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """与 build_two_source_graph 完全相同运算顺序的串行参考。"""
+    la = (a * 2.0) * 3.0
+    lb = (b * 1.5 + 1.0) * -2.0
+    return la + lb

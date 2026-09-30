@@ -15,7 +15,7 @@ import hashlib
 import json
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 class GraphError(ValueError):
@@ -91,6 +91,28 @@ class Graph:
     # ----- 查询 -----
     def dependencies(self, node_id: str) -> set:
         return set(self._deps[node_id])
+
+    def transitive_sources(self, node_id: str) -> Set[str]:
+        """节点的输出 (传递) 依赖到的全部外部源块。
+
+        源块 = 图中没有生产者、由外部 feed 喂入的块。共享输入只改变一部分
+        时, 只有依赖了该源块的分支需要重算, 未依赖它的分支可以原样复用。
+        """
+        seen: Set[str] = set()
+        stack = [node_id]
+        visited: Set[str] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            for bid in self.nodes[cur].inputs:
+                producer = self._producers.get(bid)
+                if producer is None:
+                    seen.add(bid)
+                elif producer not in visited:
+                    stack.append(producer)
+        return seen
 
     def producer_of(self, block_id: str) -> Optional[str]:
         return self._producers.get(block_id)

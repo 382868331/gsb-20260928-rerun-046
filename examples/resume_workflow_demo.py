@@ -35,8 +35,8 @@ N = 64
 N_BRANCHES = 4
 
 
-def _source():
-    rng = np.random.default_rng(2026)
+def _source(seed=2026):
+    rng = np.random.default_rng(seed)
     return rng.standard_normal(N)
 
 
@@ -52,6 +52,9 @@ def run_once(
     exit_after_commits=None,
     crash_after_block=None,
     slow=True,
+    seed=2026,
+    two_source=False,
+    corrupt_block=None,
 ):
     """在独立子进程中运行; 返回 (returncode, stdout_json_or_None, stderr)。"""
     cmd = [
@@ -63,11 +66,21 @@ def run_once(
         cmd += ["--exit-after-commits", str(exit_after_commits)]
     if crash_after_block is not None:
         cmd += ["--crash-after-block", crash_after_block]
+    if two_source:
+        cmd += ["--two-source"]
     env = dict(os.environ, PYTHONPATH=os.path.dirname(os.path.dirname(
         os.path.abspath(__file__))))
+    env["SCI_INPUT_SEED"] = str(seed)
     if slow:
         env["SCI_SLOW_SLEEP"] = "0"
         env.update(_branch_sleeps())
+    if corrupt_block is not None:
+        path = os.path.join(ckpt_dir, "blocks",
+                            corrupt_block if corrupt_block.endswith(".npy")
+                            else corrupt_block + ".npy")
+        with open(path, "r+b") as f:
+            f.seek(0)
+            f.write(b"\x00\x00")
     proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
     info = None
     for line in proc.stdout.splitlines():
@@ -123,10 +136,23 @@ def _worker_main(argv):
     p.add_argument("--budget", type=int, default=10 ** 9)
     p.add_argument("--exit-after-commits", type=int, default=None)
     p.add_argument("--crash-after-block", default=None)
+    p.add_argument("--two-source", action="store_true")
     args = p.parse_args(argv)
 
-    x = _source()
-    graph, meta = build_resume_graph(N, n_branches=N_BRANCHES)
+    seed = int(os.environ.get("SCI_INPUT_SEED", "2026"))
+    if args.two_source:
+        from sciruntime.workflow import (
+            build_two_source_graph, serial_two_source,
+        )
+        graph, meta = build_two_source_graph(N)
+        # a 源随 seed 变化, b 源固定: 支持“只改一部分共享输入”的验证。
+        feed = {meta["sources"][0]: _source(seed),
+                meta["sources"][1]: _source(31337)}
+        expected = serial_two_source(feed["__src_a"], feed["__src_b"])
+    else:
+        graph, meta = build_resume_graph(N, n_branches=N_BRANCHES)
+        feed = {meta["source"]: _source(seed)}
+        expected = _expected(feed[meta["source"]])
     ck = CheckpointStore(args.ckpt)
     ex = Executor(
         graph,
@@ -137,14 +163,14 @@ def _worker_main(argv):
         exit_after_commits=args.exit_after_commits,
         crash_after_block=args.crash_after_block,
     )
-    stats = ex.run(feed={meta["source"]: x})
+    stats = ex.run(feed=feed)
     result = ex.result(meta["output"])
     info = {
         "ok": stats.ok,
         "from_checkpoint": stats.from_checkpoint,
         "recomputed": stats.recomputed,
         "peak_inflight_bytes": stats.peak_inflight_bytes,
-        "result_equal": bool(np.array_equal(result, _expected(x))),
+        "result_equal": bool(np.array_equal(result, expected)),
     }
     print("WORKER_JSON " + json.dumps(info))
 
@@ -259,6 +285,74 @@ def main():
             pass
         else:
             raise AssertionError("不同图身份不应通过")
+
+        # ---------- 阶段 D: 输入数组改变, 图结构不变也必须全量重算 ----------
+        d = os.path.join(root, "input-change")
+        rc, info, err = run_once(d, workers=2, memory_budget=budget,
+                                 exit_after_commits=2, slow=False)
+        assert rc == 43, err
+        before = set(CheckpointStore(d).completed_nodes())
+        assert before == {"shared0", "shared1"}, before
+
+        # 先只看影响预览并取消: 旧记录一个字节都不能变。
+        g_preview, m_preview = build_resume_graph(N, n_branches=N_BRANCHES)
+        ck_preview = CheckpointStore(d)
+        plan = ck_preview.plan_recovery(
+            g_preview, {m_preview["source"]: _source(seed=9999)}
+        )
+        assert plan.reusable == set(), plan
+        assert set(plan.recompute) == before
+        assert plan.explain("shared0").startswith("输入数组内容已改变"), \
+            plan.explain("shared0")
+        assert set(CheckpointStore(d).completed_nodes()) == before, \
+            "取消预览不得改动旧记录"
+        print(plan.describe())
+
+        # 确认接续: 换 worker 数 + 不同输入, 结果必须等于新输入的串行参考。
+        rc, info, err = run_once(d, workers=4, memory_budget=budget,
+                                 seed=9999, slow=False)
+        assert rc == 0, err
+        assert info["ok"], err
+        assert info["from_checkpoint"] == [], info
+        assert set(info["recomputed"]) == set(build_resume_graph(
+            N, n_branches=N_BRANCHES)[0].nodes), info
+        assert info["result_equal"], "换输入后返回了旧输入的结果"
+
+        # 同输入再次重开: 这次所有节点都应原样复用。
+        rc, info, err = run_once(d, workers=1, memory_budget=budget,
+                                 seed=9999, slow=False)
+        assert rc == 0 and info["ok"] and info["result_equal"], err
+        assert set(info["from_checkpoint"]) == set(build_resume_graph(
+            N, n_branches=N_BRANCHES)[0].nodes), info
+
+        # ---------- 阶段 E: 共享输入只改一部分, 保留未受影响分支 ----------
+        ts = os.path.join(root, "two-source")
+        rc, info, err = run_once(ts, workers=2, memory_budget=budget,
+                                 exit_after_commits=4, slow=False,
+                                 two_source=True)
+        assert rc == 43, err
+        # 只改 __src_a 的种子, __src_b 完全不变。
+        rc, info, err = run_once(ts, workers=3, memory_budget=budget,
+                                 seed=77, slow=False, two_source=True)
+        assert rc == 0 and info["ok"] and info["result_equal"], err
+        assert set(info["from_checkpoint"]) == {"pb", "lb"}, info
+        assert set(info["recomputed"]) == {"pa", "la", "join"}, info
+
+        # ---------- 阶段 F: 换 worker + 块损坏 + 中途退出 + 换输入 ----------
+        combo = os.path.join(root, "combo")
+        rc, info, err = run_once(combo, workers=4, memory_budget=budget,
+                                 exit_after_commits=3, slow=False,
+                                 two_source=True)
+        assert rc == 43, err  # pa/pb/la 已提交, 中途硬退出
+        # 篡改未受输入变化影响的分支块 b1 (pb 的输出)。
+        rc, info, err = run_once(
+            combo, workers=1, memory_budget=budget, seed=77,
+            slow=False, two_source=True, corrupt_block="b1.npy",
+        )
+        assert rc == 0 and info["ok"] and info["result_equal"], err
+        # a 分支因输入改变重算; b 分支因损坏重算; join 依赖两侧也重算。
+        assert set(info["recomputed"]) == {"pa", "la", "pb", "lb", "join"}, info
+        assert info["from_checkpoint"] == [], info
 
         print("全部通过: 多次硬中断、变 worker 数接续, 复用/重算/在途峰值均正确。")
         print(json.dumps({
