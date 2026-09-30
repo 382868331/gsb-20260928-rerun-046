@@ -18,8 +18,13 @@
   能读到半成品; 失败节点在成功提交前的输出对任何消费者不可见。
 - **幂等发布**: 每节点只允许发布一次, 重试/恢复重放重复执行也不会重复
   `put`; BlockStore 对重复 block_id 的发布直接报错做防御。
-- **检查点恢复**: 所有输出块先原子落盘 (temp + rename) 再更新 `meta.json`,
-  恢复时已完成节点整体跳过、块灌回内存, 结果可逐位重现。
+- **细粒度检查点接续**: 输出块先原子落盘 (temp + rename), 再连同
+  sha256 一起更新 `meta.json`; 只有“完整发布 **且** 校验和核验通过
+  **且** 前驱全部可信”的节点能复用。正在写出的块 (*.tmp / 无 meta
+  的孤儿文件)、损坏块及其全部后继在重开时一律失效重算, 后继不可能
+  提前读到半成品或失败节点的输出。检查点绑定图身份哈希, 恢复允许
+  改变 worker 数 / 内存预算 / 后端, 但不允许换图复用。恢复时块按需
+  从磁盘惰性物化, 紧内存预算下也不会“一恢复就死锁”。
 - **可扩展算子**: 实现 `Operator.run(inputs, params, ctx)` 并
   `register_operator` 即可, 依赖调度与数据生命周期完全复用, 无需改运行时。
 
@@ -34,8 +39,23 @@
 
 ```bash
 .venv/bin/python -m examples.blocked_matmul_demo   # 线程/子进程/恢复三个场景
-.venv/bin/python -m pytest tests/ -q               # 8 个测试
+.venv/bin/python -m examples.resume_workflow_demo  # 真实硬中断后变 worker 接续
+.venv/bin/python -m pytest tests/ -q               # 13 个测试
 ```
+
+### 接续演示验证了什么
+
+`examples/resume_workflow_demo.py` 用“共享前置 -> 4 条慢分支 -> fan-in
+归约”的内存受限图, 在**独立子进程**里多次真实中断 (SIGKILL /
+os._exit, 无 finally、无缓冲刷新), 而不是整图跑完后再加载:
+
+- 共享节点提交后、慢分支执行到一半时 SIGKILL, 换 worker 数重开;
+- 某个块文件 rename 之后、meta.json 更新之前 os._exit(42)
+  (写出一半): 孤儿块对后继不可见, 下次打开时清除并重算;
+- 篡改一个已提交块: 校验和失配, 该节点及其全部后继重算;
+- 每次重开核对复用集合 (stats.from_checkpoint)、重算集合
+  (stats.recomputed)、峰值在途数据 (stats.peak_inflight_bytes)
+  及与串行参考逐位一致的最终结果。
 
 ```python
 from sciruntime import Executor

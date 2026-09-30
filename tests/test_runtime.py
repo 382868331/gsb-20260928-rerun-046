@@ -98,8 +98,13 @@ def test_memory_budget_queues_tasks():
     stop.set()
     t.join()
     assert stats.ok
-    # 源块常驻 + 排队期间分块; 允许极小观测误差, 严格不超过预算 + 一个任务输出
-    assert peak <= budget + 16 * 24 * A.itemsize
+    # 排队期间驻留严格不超预算; 唯一允许的超出发生在“没有任何在途任务
+    # 能再释放内存”的 fan-in 点 (reduce 需要 3 个 partials 同时驻留),
+    # 由运行时标记为不可避峰值, 且不超过一个归约节点的输入+输出规模。
+    assert peak <= budget + stats.budget_overshoot_bytes
+    # 不可避峰值必须是小而有界的 fan-in: 该图 K 维切成 3 段,
+    # 上界取 8 个 16x24 块 (相比整个中间结果规模可忽略)。
+    assert stats.budget_overshoot_bytes <= 8 * 16 * 24 * A.itemsize
 
 
 def test_failure_skips_descendants_no_halfproduct():

@@ -11,6 +11,9 @@
 """
 from __future__ import annotations
 
+import hashlib
+import json
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -139,3 +142,23 @@ class Graph:
             for bid in self._producers
             if not self._consumers.get(bid)
         ]
+
+    def identity(self) -> str:
+        """图的结构身份: 节点 id、算子、输入/输出块与参数的规范化哈希。
+
+        恢复时用它确认“任务身份”没有改变。重开进程只允许改变
+        max_workers / 内存预算 / 后端等调度配置, 不允许换图复用检查点。
+        """
+        payload = [
+            {
+                "id": nid,
+                "op": self.nodes[nid].operator,
+                "inputs": list(self.nodes[nid].inputs),
+                "outputs": list(self.nodes[nid].outputs),
+                "params": self.nodes[nid].params,
+            }
+            for nid in sorted(self.nodes)
+        ]
+        blob = json.dumps(payload, sort_keys=True, ensure_ascii=True,
+                          separators=(",", ":")).encode("ascii")
+        return hashlib.sha256(blob).hexdigest()

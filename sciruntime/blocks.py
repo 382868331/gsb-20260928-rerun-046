@@ -56,6 +56,8 @@ class BlockStore:
         self._remaining_consumers: Dict[str, int] = {}
         # 最终输出块: 消费者数为 0, 保留到调用方显式 release_output
         self._retained_outputs: set = set()
+        # 可选的惰性加载器 (检查点恢复), block_id -> ndarray
+        self._lazy_loader = None
 
     # ----- 调度器登记的生命周期信息 -----
     def register_block(self, block_id: str, consumer_count: int, *, retain: bool = False) -> None:
@@ -92,6 +94,8 @@ class BlockStore:
             return self._data[block_id]
 
     def get(self, block_id: str) -> np.ndarray:
+        if not self.contains(block_id) and getattr(self, "_lazy_loader", None):
+            self.preload(block_id)
         with self._lock:
             try:
                 return self._data[block_id]
@@ -167,4 +171,21 @@ class BlockStore:
         with self._lock:
             for bid, val in items.items():
                 self._data.setdefault(bid, np.asarray(val))
+            self._lock.notify_all()
+
+    # ----- 延迟物化: 恢复时避免一次性把全部检查点块灌爆内存预算 -----
+    def set_loader(self, loader) -> None:
+        """注册 block_id -> ndarray 的惰性加载器 (如检查点磁盘读)。"""
+        with self._lock:
+            self._lazy_loader = loader
+
+    def preload(self, block_id: str) -> None:
+        """在调度器持锁路径外安全地把一个块从磁盘物化进内存。"""
+        with self._lock:
+            if block_id in self._data or getattr(self, "_lazy_loader", None) is None:
+                return
+            loader = self._lazy_loader
+        value = np.asarray(loader(block_id))
+        with self._lock:
+            self._data.setdefault(block_id, value)
             self._lock.notify_all()

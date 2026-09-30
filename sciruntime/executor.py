@@ -72,6 +72,10 @@ class ExecutionStats:
     failed: Dict[str, str] = field(default_factory=dict)
     skipped: List[str] = field(default_factory=list)
     from_checkpoint: List[str] = field(default_factory=list)
+    recomputed: List[str] = field(default_factory=list)
+    peak_inflight_bytes: int = 0
+    # “没有在途任务可释放内存”时, fan-in 节点不可避免的超预算峰值
+    budget_overshoot_bytes: int = 0
 
     @property
     def ok(self) -> bool:
@@ -100,6 +104,8 @@ class Executor:
         backend: str = "thread",
         checkpoint: Optional[CheckpointStore] = None,
         max_retries: int = 0,
+        crash_after_block: Optional[str] = None,
+        exit_after_commits: Optional[int] = None,
     ) -> None:
         self.graph = graph
         self.store = store or BlockStore()
@@ -109,6 +115,9 @@ class Executor:
         self.memory_budget = memory_budget
         self.checkpoint = checkpoint
         self.max_retries = max_retries
+        self._crash_after_block = crash_after_block
+        self._exit_after_commits = exit_after_commits
+        self._committed = 0
 
         self._cond = threading.Condition()
         self._remaining_deps: Dict[str, int] = {}
@@ -119,6 +128,7 @@ class Executor:
         self._published: set = set()
         self._pinned_inputs: Dict[str, List[str]] = {}
         self._stats = ExecutionStats()
+        self._resumable: set = set()
 
     # ---------- 公共入口 ----------
     def run(self, feed: Optional[Dict[str, np.ndarray]] = None) -> ExecutionStats:
@@ -141,6 +151,7 @@ class Executor:
                     newly = self._pump_locked(pool)
                     for nid, fut in newly:
                         inflight[fut] = nid
+                    self._record_inflight_peak_locked()
                 if not inflight:
                     # 没有在跑任务: 可能全部跳过/失败, 或内存预算下暂时无法启动
                     with self._cond:
@@ -150,7 +161,7 @@ class Executor:
                         ]
                     if not remaining:
                         break
-                    # 预算下无法启动新任务, 且没有任务在跑: 预算配置无解
+                    # 没有在途任务却仍有节点未完成: 内部状态不一致
                     raise RuntimeError(
                         "内存预算过小: 没有正在执行的任务, 但仍有节点无法启动: "
                         f"{remaining[:3]} ..."
@@ -162,6 +173,8 @@ class Executor:
                     with self._cond:
                         self._resolve_future_locked(nid, fut)
                         self._cond.notify_all()
+                with self._cond:
+                    self._record_inflight_peak_locked()
         finally:
             pool.shutdown(wait=True)
             self.store.collect_garbage()
@@ -174,9 +187,18 @@ class Executor:
     def _prepare(self, feed: Dict[str, np.ndarray]) -> None:
         checkpoint_done: set = set()
         if self.checkpoint is not None:
-            checkpoint_done = {
-                nid for nid in self.graph.nodes if self.checkpoint.is_completed(nid)
+            self.checkpoint.attach_graph(self.graph.identity())
+            predecessors = {
+                nid: {self.graph.producer_of(bid) for bid in node.inputs}
+                for nid, node in self.graph.nodes.items()
             }
+            for nid, deps in predecessors.items():
+                deps.discard(None)
+            # 只有“完整发布 + 校验和核验 + 前驱全部可信”的节点能复用。
+            checkpoint_done = self.checkpoint.verify_for_graph(
+                self.graph.topological_order(), predecessors
+            )
+            self._resumable = set(checkpoint_done)
         # 生命周期登记: 每个块 *仍待执行* 的消费者数量。
         # 最终输出块 (无消费者) 保留, 调用方取走结果后可用 collect 显式回收。
         for bid in self.graph.all_blocks():
@@ -184,7 +206,12 @@ class Executor:
                 c for c in self.graph.consumers_of(bid) if c not in checkpoint_done
             ]
             self.store.register_block(
-                bid, len(live_consumers), retain=not live_consumers
+                bid,
+                len(live_consumers),
+                # 只有图的最终输出块 (本来就没有任何消费者) 才保留。
+                # 不能因为“待执行消费者恰好为 0”就 retain——恢复时
+                # 所有下游都在 pending, 那会把已恢复的中间块全部钉住。
+                retain=not self.graph.consumers_of(bid),
             )
         # 外部喂入的源块 (登记其图内消费者数量, 避免被提前回收)
         for bid, val in feed.items():
@@ -192,27 +219,44 @@ class Executor:
                 live = [
                     c for c in self.graph.consumers_of(bid) if c not in checkpoint_done
                 ]
-                self.store.register_block(bid, len(live))
+                self.store.register_block(
+                    bid, len(live), retain=not self.graph.consumers_of(bid)
+                )
             self.store.put(bid, np.asarray(val))
         for nid, node in self.graph.nodes.items():
             deps = {self.graph.producer_of(bid) for bid in node.inputs}
             deps.discard(None)
             self._remaining_deps[nid] = len(deps)
             for d in deps:
-                self._children.setdefault(d, []).append(nid)
+                children = self._children.setdefault(d, [])
+                if nid not in children:
+                    children.append(nid)
 
-        # 检查点恢复: 已完成节点直接标成功并灌回块
+        # 检查点恢复: 已核验节点直接标成功。块按需从磁盘惰性物化,
+        # 而不是一次性全灌入内存 (否则紧预算下恢复即死锁)。
         if self.checkpoint is not None:
-            restored = self.checkpoint.load_completed(self.graph.nodes)
+            self.store.set_loader(self.checkpoint.load_block)
             completed_on_disk = [
-                nid for nid in self.graph.nodes if self.checkpoint.is_completed(nid)
+                nid for nid in self.graph.nodes if nid in checkpoint_done
             ]
-            self.store.restore(restored)
             for nid in completed_on_disk:
                 self._mark_published_locked(nid)
                 self._done[nid] = NodeResult("success")
                 self._stats.from_checkpoint.append(nid)
                 self._stats.succeeded.append(nid)
+                # 已恢复节点不会再走实时完成路径, 这里显式把其全部
+                # 后继的剩余依赖数减掉, 否则后继永远停在 deps>0。
+                for child in self._children.get(nid, ()):
+                    self._remaining_deps[child] -= 1
+
+    def _record_inflight_peak_locked(self) -> None:
+        """记录峰值在途数据量: 驻留块 + 正在执行节点声明的工作内存。"""
+        working = sum(
+            self.graph.nodes[nid].memory_bytes for nid in self._inflight
+        )
+        peak = self.store.resident_bytes() + working
+        if peak > self._stats.peak_inflight_bytes:
+            self._stats.peak_inflight_bytes = peak
 
     # ---------- 调度循环 ----------
     def _ready_nodes_locked(self) -> List[str]:
@@ -235,12 +279,6 @@ class Executor:
         for nid in self._ready_nodes_locked():
             node = self.graph.nodes[nid]
             budget = self.memory_budget
-            if budget is not None:
-                resident = self.store.resident_bytes()
-                need = self._required_memory_locked(node)
-                if resident + need > budget:
-                    continue  # 内存不足: 保持排队
-
             # 先取消检查: 任一依赖失败/跳过则本节点跳过
             bad_dep = [
                 d for d in self.graph.dependencies(nid)
@@ -249,6 +287,22 @@ class Executor:
             if bad_dep:
                 self._skip_chain_locked(nid, cause=f"上游 {bad_dep[0]} 未成功")
                 continue
+
+            # 检查点块此时才真正从磁盘读入, 计入驻留内存后再判预算。
+            for bid in node.inputs:
+                self.store.preload(bid)
+            need = self._required_memory_locked(node)
+            if budget is not None:
+                resident = self.store.resident_bytes()
+                # 没有任何任务在途时, 内存已不会再被前序释放;
+                # 此时继续排队必然死锁, 必须放行 (预算下的不可避峰值)。
+                if self._inflight and resident + need > budget:
+                    continue  # 真正的可选占用超预算: 排队等待前序释放
+                if resident + need > budget:
+                    overshoot = resident + need - budget
+                    self._stats.budget_overshoot_bytes = max(
+                        self._stats.budget_overshoot_bytes, overshoot
+                    )
 
             # pin 输入, 保证执行期间不被回收
             inputs = [self.store.get(bid) for bid in node.inputs]
@@ -300,7 +354,7 @@ class Executor:
             return
         if self.checkpoint is not None:
             try:
-                self.checkpoint.commit_node(nid, node.outputs, outputs)
+                self._commit_checkpoint(node, outputs)
             except Exception as exc:
                 self._finish_failure_locked(nid, exc)
                 self._stats.failed[nid] = repr(exc)
@@ -331,6 +385,8 @@ class Executor:
         if nid not in self._done:
             self._done[nid] = NodeResult("success")
             self._stats.succeeded.append(nid)
+            if nid not in self._resumable and nid not in self._stats.recomputed:
+                self._stats.recomputed.append(nid)
         for child in self._children.get(nid, ()):
             self._remaining_deps[child] -= 1
         self._inflight.pop(nid, None)
@@ -370,3 +426,21 @@ class Executor:
             except RuntimeError:
                 pass
             self.store.consumer_finished(bid)
+
+    def _commit_checkpoint(self, node: Node, outputs: Sequence[np.ndarray]) -> None:
+        checkpoint = self.checkpoint
+        if self._crash_after_block is None:
+            checkpoint.commit_node(node.node_id, node.outputs, outputs)
+        else:
+            # 带硬中断钩子的检查点 (通常由独立子进程使用)。
+            from .checkpoint import CheckpointStore as _CS
+
+            crashing = _CS(str(checkpoint.path),
+                           crash_after_block=self._crash_after_block)
+            crashing.attach_graph(checkpoint.graph_id)
+            crashing.commit_node(node.node_id, node.outputs, outputs)
+        self._committed += 1
+        if (self._exit_after_commits is not None
+                and self._committed >= self._exit_after_commits):
+            # 已提交若干完整节点后硬退出, 模拟“跑到一半”被杀死。
+            os._exit(43)
