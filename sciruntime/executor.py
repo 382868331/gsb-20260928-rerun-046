@@ -365,6 +365,11 @@ class Executor:
         if self.checkpoint is not None:
             try:
                 self._commit_checkpoint(node, outputs)
+                self._committed += 1
+                if (self._exit_after_commits is not None
+                        and self._committed >= self._exit_after_commits):
+                    # 已提交若干完整的新节点后硬退出, 模拟“跑到一半”被杀死。
+                    os._exit(43)
             except Exception as exc:
                 self._finish_failure_locked(nid, exc)
                 self._stats.failed[nid] = repr(exc)
@@ -447,12 +452,12 @@ class Executor:
 
             crashing = _CS(str(checkpoint.path),
                            crash_after_block=self._crash_after_block)
-            crashing.attach_graph(checkpoint.graph_id)
+            crashing.attach_graph(
+                checkpoint.graph_id, checkpoint._graph_manifest
+            )
+            crashing._revision_id = checkpoint.revision_id
+            crashing._lineage = dict(checkpoint._lineage)
+            crashing._provenance = dict(checkpoint._provenance)
             # 保留已确认的输入指纹, 避免硬退出钩子写 meta 时把它清空。
             crashing._inputs = dict(checkpoint._inputs)
             crashing.commit_node(node.node_id, node.outputs, outputs)
-        self._committed += 1
-        if (self._exit_after_commits is not None
-                and self._committed >= self._exit_after_commits):
-            # 已提交若干完整节点后硬退出, 模拟“跑到一半”被杀死。
-            os._exit(43)
