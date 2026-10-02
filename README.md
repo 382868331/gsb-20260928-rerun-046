@@ -27,13 +27,21 @@
   的分支原样保留 (共享输入只改一部分时只重算受影响分支)。正在写出的块
   (*.tmp / 无 meta 的孤儿文件)、损坏块及其全部后继在重开时一律失效重算,
   后继不可能提前读到半成品或失败节点的输出。检查点绑定图身份哈希,
-  恢复允许改变 worker 数 / 内存预算 / 后端, 但不允许换图复用。恢复时块
-  按需从磁盘惰性物化, 紧内存预算下也不会“一恢复就死锁”。
+  恢复允许改变 worker 数 / 内存预算 / 后端; 同一检查点目录不直接换图,
+  图结构调整通过只读预览后派生独立候选检查点。恢复时块按需从磁盘惰性
+  物化, 紧内存预算下也不会“一恢复就死锁”。
 - **恢复前影响预览 (可取消)**: `CheckpointStore.plan_recovery(graph, feed)`
   是纯只读检查, 返回 `RecoveryPlan`, 列出哪些节点可复用、哪些必须重算
   及原因 (`输入改变` / `输入无法核验` / `上游依赖重算` / `结果块损坏`),
   `RecoveryPlan.describe()` 给出可读文本; 只要不调用 `apply_recovery` /
   不运行 Executor, 盘上旧 meta 和块文件一个字节都不变, 用户可以取消。
+- **从旧检查点派生新图**: 插入校正、替换计算或删除分支后使用
+  `CheckpointStore.plan_revision(new_graph, old_graph, feed)` 做只读预览。
+  预览分别列出输入变化与计算关系变化, 只复用当前图仍能解释的节点;
+  下游改接其他来源时按新依赖重新判定, 未受影响的独立分支继续复用。
+  `materialize_revision(...)` 会把可复用块复制到新的候选检查点目录,
+  多个候选可从同一旧检查点并行比较和执行, 任一候选失败不会覆盖原图或
+  其他候选; 每份复用结果都在 `provenance` 中记录来源图、来源节点和链。
 - **可扩展算子**: 实现 `Operator.run(inputs, params, ctx)` 并
   `register_operator` 即可, 依赖调度与数据生命周期完全复用, 无需改运行时。
 
@@ -49,7 +57,7 @@
 ```bash
 .venv/bin/python -m examples.blocked_matmul_demo   # 线程/子进程/恢复三个场景
 .venv/bin/python -m examples.resume_workflow_demo  # 真实硬中断后变 worker 接续
-.venv/bin/python -m pytest tests/ -q               # 17 个测试
+.venv/bin/python -m pytest tests/ -q               # 21 个测试
 ```
 
 ### 接续演示验证了什么
