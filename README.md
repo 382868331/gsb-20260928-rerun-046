@@ -103,3 +103,31 @@ class MyOp(Operator):
 
 register_operator("my_op", MyOp())  # 然后即可在图节点中用 operator="my_op"
 ```
+
+## taskgraph: 按计算结果展开的任务图
+
+taskgraph/ 在 sciruntime 之上补充「先检查数据、再决定展开哪些后续任务」的
+动态任务图：
+
+- **发现（discovery）**：discover_step(step, params) -> (specs, done)，
+  以持久化游标逐步推进，可中断、可恢复；每步可产生若干 PartitionSpec。
+- **分区计算（partition）**：compute(input, params)，结果按分区身份存档。
+- **汇总（aggregation）**：aggregate(entries, params)，仅对确定范围标记
+  complete；发现未结束时最多为 partial，且 scope 明确记录覆盖哪些分区。
+
+关键不变量：
+
+- **分区身份 = hash(compute_version, input)**，与名称无关。相同分区被重复
+  通知时忽略：不重复计算、不重复汇总。
+- **断点恢复**：每个工作单元完成后原子落盘（Store 每分支一个状态文件）。
+  改变并行度、发现新分区即停、汇总前再恢复，最终结果与从头执行一致。
+- **修订（revise）**：从旧分支派生新分支（copy-on-write，失败方案不影响
+  原图与兄弟方案）。仅当旧分区的输入与计算含义（compute_version）都不变时
+  才保留结果，且必须被新发现过程**重新通知**才生效；被删除/拆分/合并的
+  旧分区在发现结束时自动剔除，不会混入汇总范围。同名不同含义不复用。
+- **观测**：事件流区分 discovery / partition / aggregation 及各自 scope；
+  progress() 为只读查询，不触发新的发现或计算。
+
+测试见 tests/test_recovery.py（空分区、迟到分区、重复通知去重、部分失败
+重试、分区拆分/合并/删除的修订复用、并行度与中断点不变性、失败方案隔离、
+进度查询无副作用）。
